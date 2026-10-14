@@ -8,7 +8,28 @@ from app.models import Tenant, UsageEvent, Plan
 
 from sqlalchemy import func
 
+from pwdlib import PasswordHash
+from app.models import User
+
+import os
+from datetime import datetime, timedelta, timezone
+
+import jwt
+from dotenv import load_dotenv
+
 app = FastAPI()
+
+password_hash = PasswordHash.recommended()
+
+load_dotenv()
+
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+
+if not JWT_SECRET_KEY:
+    raise RuntimeError("JWT_SECRET_KEY is missing from .env")
+
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 class TenantCreate(BaseModel):
     name: str = Field(min_length=2, max_length=100)
@@ -59,6 +80,41 @@ class PlanAssignmentResponse(BaseModel):
     plan_id: int
     plan_name: str
 
+class UserCreate(BaseModel):
+    email: str 
+    password: str = Field(min_length=8, max_length=128)
+
+
+class UserResponse(BaseModel):
+    id: int
+    tenant_id: int
+    email: str
+    is_active: bool
+
+    model_config = ConfigDict(from_attributes=True)    
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+def create_access_token(user: User) -> str:
+    now = datetime.now(timezone.utc)
+
+    payload = {
+        "sub": str(user.id),
+        "tenant_id": user.tenant_id,
+        "iat": now,
+        "exp": now + timedelta(
+            minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+        )
+    }
+
+    return jwt.encode(
+        payload,
+        JWT_SECRET_KEY,
+        algorithm=JWT_ALGORITHM
+    )    
 
 @app.post("/tenants", response_model=TenantResponse)
 def create_tenant(
@@ -202,3 +258,87 @@ def assign_plan(
         "plan_id": plan.id,
         "plan_name": plan.name
     }
+
+
+@app.get("/plans", response_model=list[PlanResponse])
+def get_plans(db: Session = Depends(get_db)):
+    plans = db.query(Plan).all()
+    return plans    
+
+
+@app.post(
+    "/tenants/{tenant_id}/users",
+    response_model=UserResponse,
+    status_code=201
+)
+def register_user(
+    tenant_id: int,
+    user_data: UserCreate,
+    db: Session = Depends(get_db)
+):
+    tenant = db.get(Tenant, tenant_id)
+
+    if tenant is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Tenant not found"
+        )
+
+    existing_user = (
+        db.query(User)
+        .filter(User.email == user_data.email)
+        .first()
+    )
+
+    if existing_user:
+        raise HTTPException(
+            status_code=409,
+            detail="Email already registered"
+        )
+
+    hashed_password = password_hash.hash(user_data.password)
+
+    user = User(
+        tenant_id=tenant_id,
+        email=user_data.email,
+        hashed_password=hashed_password
+    )
+
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    return user
+
+@app.post("/login")
+def login(
+    login_data: LoginRequest,
+    db: Session = Depends(get_db)
+):
+    user = (
+        db.query(User)
+        .filter(User.email == login_data.email)
+        .first()
+    )
+
+    if user is None or not password_hash.verify(
+        login_data.password,
+        user.hashed_password
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password"
+        )
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=403,
+            detail="Account is inactive"
+        )
+
+    access_token = create_access_token(user)
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer"
+    }    
