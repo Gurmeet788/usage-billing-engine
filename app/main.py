@@ -128,6 +128,7 @@ def get_current_user(
     db: Session = Depends(get_db)
 ) -> User:
     token = credentials.credentials
+    print(token)
 
     try:
         payload = jwt.decode(
@@ -195,8 +196,15 @@ def get_tenants(db: Session = Depends(get_db)):
 def record_usage(
     tenant_id: int,
     usage_data: UsageCreate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
+    if current_user.tenant_id != tenant_id:
+        raise HTTPException(
+            status_code=403,
+            detail="You cannot access this tenant"
+        )
+    
     tenant = db.get(Tenant, tenant_id)
 
     if tenant is None:
@@ -224,8 +232,15 @@ def record_usage(
 )
 def get_usage_summary(
     tenant_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
+    if current_user.tenant_id != tenant_id:
+        raise HTTPException(
+            status_code=403,
+            detail="You cannot access this tenant"
+        )
+        
     tenant = db.get(Tenant, tenant_id)
 
     if tenant is None:

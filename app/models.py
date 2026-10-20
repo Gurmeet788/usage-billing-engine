@@ -69,5 +69,6 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(
         Boolean,
         default=True,
+        server_default="1",
         nullable=False
     )   
