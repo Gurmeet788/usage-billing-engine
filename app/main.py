@@ -17,6 +17,9 @@ from datetime import datetime, timedelta, timezone
 import jwt
 from dotenv import load_dotenv
 
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jwt.exceptions import InvalidTokenError
+
 app = FastAPI()
 
 password_hash = PasswordHash.recommended()
@@ -114,7 +117,47 @@ def create_access_token(user: User) -> str:
         payload,
         JWT_SECRET_KEY,
         algorithm=JWT_ALGORITHM
-    )    
+    )   
+
+
+security = HTTPBearer()
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+) -> User:
+    token = credentials.credentials
+
+    try:
+        payload = jwt.decode(
+            token,
+            JWT_SECRET_KEY,
+            algorithms=[JWT_ALGORITHM]
+        )
+
+        user_id = payload.get("sub")
+
+        if user_id is None:
+            raise InvalidTokenError("Missing user ID")
+
+        user = db.get(User, int(user_id))
+
+    except (InvalidTokenError, ValueError, TypeError):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+
+    if user is None or not user.is_active:
+        raise HTTPException(
+            status_code=401,
+            detail="User not found or inactive",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+
+    return user     
 
 @app.post("/tenants", response_model=TenantResponse)
 def create_tenant(
@@ -341,4 +384,10 @@ def login(
     return {
         "access_token": access_token,
         "token_type": "bearer"
-    }    
+    }  
+
+@app.get("/me", response_model=UserResponse)
+def get_me(
+    current_user: User = Depends(get_current_user)
+):
+    return current_user      
