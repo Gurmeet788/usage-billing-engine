@@ -42,7 +42,7 @@ class Plan(Base):
     name: Mapped[str] = mapped_column(String(50), unique=True)
     monthly_price: Mapped[int] = mapped_column(nullable=False)
     included_requests: Mapped[int] = mapped_column(nullable=False)
-    overage_rate: Mapped[int] = mapped_column(default=1, server_default = 1, nullable=False)
+    overage_rate: Mapped[int] = mapped_column(default=1, server_default='1', nullable=False)
 
 class User(Base):
     __tablename__ = "users"
