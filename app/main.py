@@ -104,9 +104,18 @@ class LoginRequest(BaseModel):
 class TenantRegister(BaseModel):
     name: str = Field(min_length=2, max_length=100)
     email: str
-    password: str = Field(min_length=8, max_length=128) 
-    
-       
+    password: str = Field(min_length=8, max_length=128)    
+
+class BillingResponse(BaseModel):
+    tenant_id: int
+    plan_name: str
+    monthly_price: int
+    included_requests: int
+    total_requests: int
+    extra_requests: int
+    overage_rate: int
+    overage_charge: int
+    total_bill: int
 
 def create_access_token(user: User) -> str:
     now = datetime.now(timezone.utc)
@@ -501,7 +510,56 @@ def register_tenant(
 
     return user
 
+@app.get("/tenants/{tenant_id}/billing", response_model=BillingResponse)
+def get_billing(
+    tenant_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.tenant_id != tenant_id:
+        raise HTTPException(
+            status_code=403,
+            detail="You cannot access another tenant's billing"
+        )
 
+    tenant = db.get(Tenant, tenant_id)
+
+    if tenant is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    if tenant.plan_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Tenant has no assigned plan"
+        )
+
+    plan = db.get(Plan, tenant.plan_id)
+
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    total_requests = (
+        db.query(func.coalesce(func.sum(UsageEvent.quantity), 0))
+        .filter(UsageEvent.tenant_id == tenant_id)
+        .scalar()
+    )
+
+    extra_requests = max(0, total_requests - plan.included_requests)
+    overage_charge = extra_requests * plan.overage_rate
+    total_bill = plan.monthly_price + overage_charge
+
+    return BillingResponse(
+        tenant_id=tenant.id,
+        plan_name=plan.name,
+        monthly_price=plan.monthly_price,
+        included_requests=plan.included_requests,
+        total_requests=total_requests,
+        extra_requests=extra_requests,
+        overage_rate=plan.overage_rate,
+        overage_charge=overage_charge,
+        total_bill=total_bill
+    )
+    
 @app.get("/me", response_model=UserResponse)
 def get_me(
     current_user: User = Depends(get_current_user)
