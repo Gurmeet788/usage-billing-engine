@@ -1,5 +1,4 @@
-
-from sqlalchemy import String, ForeignKey, DateTime, func, Boolean
+from sqlalchemy import String, ForeignKey, DateTime, func, Boolean, Integer, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 class Base(DeclarativeBase):
@@ -79,3 +78,47 @@ class User(Base):
         server_default="1",
         nullable=False
     )   
+
+class Invoice(Base):
+    __tablename__ = "invoices"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "billing_period_start",
+            name="uq_invoice_tenant_billing_period"
+        ),
+    )   
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    tenant_id: Mapped[int] = mapped_column(
+        ForeignKey("tenants.id"),
+        nullable=False
+    )
+
+    billing_period_start: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False
+    )
+
+    billing_period_end: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False
+    )
+
+    plan_price: Mapped[int] = mapped_column(Integer, nullable=False)
+    overage_charge: Mapped[int] = mapped_column(Integer, nullable=False)
+    total_amount: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    status: Mapped[str] = mapped_column(
+        String(20),
+        default="pending",
+        server_default="pending",
+        nullable=False
+    )
+
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False
+    )
