@@ -1,4 +1,6 @@
 
+from sqlalchemy.exc import IntegrityError
+from app.models import Invoice
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, ConfigDict, Field
@@ -116,6 +118,21 @@ class BillingResponse(BaseModel):
     overage_rate: int
     overage_charge: int
     total_bill: int
+
+ 
+class InvoiceResponse(BaseModel):
+    id: int
+    tenant_id: int
+    billing_period_start: datetime
+    billing_period_end: datetime
+    plan_price: int
+    overage_charge: int
+    total_amount: int
+    status: str
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+   
 
 def create_access_token(user: User) -> str:
     now = datetime.now(timezone.utc)
@@ -241,18 +258,20 @@ def record_usage(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if current_user.tenant_id != tenant_id:
-        raise HTTPException(
-            status_code=403,
-            detail="You cannot access this tenant"
-        )
-    
-    tenant = db.get(Tenant, tenant_id)
+    tenant = db.query(Tenant).filter(
+        Tenant.id == tenant_id
+    ).first()
 
-    if tenant is None:
+    if not tenant:
         raise HTTPException(
             status_code=404,
             detail="Tenant not found"
+        )
+
+    if current_user.tenant_id != tenant_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied"
         )
 
     usage = UsageEvent(
@@ -277,20 +296,22 @@ def get_usage_summary(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if current_user.tenant_id != tenant_id:
-        raise HTTPException(
-            status_code=403,
-            detail="You cannot access this tenant"
-        )
-        
-    tenant = db.get(Tenant, tenant_id)
+    tenant = db.query(Tenant).filter(
+        Tenant.id == tenant_id
+    ).first()
 
-    if tenant is None:
+    if not tenant:
         raise HTTPException(
             status_code=404,
             detail="Tenant not found"
         )
 
+    if current_user.tenant_id != tenant_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied"
+        )
+        
     summary = (
         db.query(
             UsageEvent.event_type,
@@ -559,7 +580,122 @@ def get_billing(
         overage_charge=overage_charge,
         total_bill=total_bill
     )
-    
+
+@app.post(
+    "/tenants/{tenant_id}/invoices",
+    response_model=InvoiceResponse,
+    status_code=201
+)
+def create_invoice(
+    tenant_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    # 1. Check tenant access
+    if current_user.tenant_id != tenant_id:
+        raise HTTPException(
+            status_code=403,
+            detail="You cannot create invoices for another tenant"
+        )
+
+    # 2. Find tenant
+    tenant = db.get(Tenant, tenant_id)
+
+    if tenant is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    # 3. Check assigned plan
+    if tenant.plan_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Tenant has no assigned plan"
+        )
+
+    plan = db.get(Plan, tenant.plan_id)
+
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    # 4. Calculate the current monthly billing period
+    now = datetime.now(timezone.utc)
+
+    period_start = now.replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+
+
+    # Check whether an invoice already exists for this billing period
+    existing_invoice = (
+        db.query(Invoice)
+        .filter(
+            Invoice.tenant_id == tenant_id,
+            Invoice.billing_period_start == period_start
+        )
+        .first()
+    )
+
+    if existing_invoice:
+        raise HTTPException(
+            status_code=409,
+            detail="An invoice already exists for this billing period"
+        )
+
+
+    if period_start.month == 12:
+        period_end = period_start.replace(
+            year=period_start.year + 1, month=1
+        )
+    else:
+        period_end = period_start.replace(
+            month=period_start.month + 1
+        )
+
+    # 5. Calculate total usage during this period
+    total_requests = (
+        db.query(func.coalesce(func.sum(UsageEvent.quantity), 0))
+        .filter(
+            UsageEvent.tenant_id == tenant_id,
+            UsageEvent.created_at >= period_start,
+            UsageEvent.created_at < period_end
+        )
+        .scalar()
+    )
+
+    # 6. Calculate charges
+    extra_requests = max(
+        0, total_requests - plan.included_requests
+    )
+
+    overage_charge = extra_requests * plan.overage_rate
+    total_amount = plan.monthly_price + overage_charge
+
+    # 7. Create invoice record
+    invoice = Invoice(
+        tenant_id=tenant_id,
+        billing_period_start=period_start,
+        billing_period_end=period_end,
+        plan_price=plan.monthly_price,
+        overage_charge=overage_charge,
+        total_amount=total_amount,
+        status="pending"
+    )
+
+    # 8. Save invoice to the database
+    db.add(invoice)
+
+    try:
+        db.commit()
+        db.refresh(invoice)
+    except IntegrityError:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=409,
+            detail="An invoice already exists for this billing period"
+        )
+
+    return invoice
+
 @app.get("/me", response_model=UserResponse)
 def get_me(
     current_user: User = Depends(get_current_user)
