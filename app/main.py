@@ -1,26 +1,25 @@
 
+from fastapi import Request
 from sqlalchemy.exc import IntegrityError
 from app.models import Invoice
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, ConfigDict, Field
-
 from app.database import get_db
 from app.models import Tenant, UsageEvent, Plan 
-
 from sqlalchemy import func
-
 from pwdlib import PasswordHash
 from app.models import User
-
 import os
 from datetime import datetime, timedelta, timezone
-
 import jwt
 from dotenv import load_dotenv
-
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jwt.exceptions import InvalidTokenError
+from urllib.parse import urlencode
+from app import safepay_service
+import json
+import logging
 
 app = FastAPI()
 
@@ -130,6 +129,7 @@ class InvoiceResponse(BaseModel):
     total_amount: int
     status: str
     created_at: datetime
+    safepay_tracker: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
    
@@ -311,7 +311,7 @@ def get_usage_summary(
             status_code=403,
             detail="Access denied"
         )
-        
+
     summary = (
         db.query(
             UsageEvent.event_type,
@@ -695,6 +695,104 @@ def create_invoice(
         )
 
     return invoice
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Safepay – initiate payment for a pending invoice
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post("/tenants/{tenant_id}/invoices/{invoice_id}/pay")
+def initiate_invoice_payment(
+    tenant_id: int,
+    invoice_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Create a Safepay checkout session for a pending invoice.
+    Returns a checkout_url to redirect the frontend user to.
+    """
+    if current_user.tenant_id != tenant_id:
+        raise HTTPException(
+            status_code=403,
+            detail="You cannot pay invoices for another tenant"
+        )
+
+    invoice = db.get(Invoice, invoice_id)
+
+    if invoice is None or invoice.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    if invoice.status == "paid":
+        raise HTTPException(status_code=409, detail="Invoice is already paid")
+
+    try:
+        result = safepay_service.create_tracker(amount_pkr=invoice.total_amount)
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    # Persist tracker token so the webhook can look up this invoice later
+    invoice.safepay_tracker = result["tracker_token"]
+    db.commit()
+
+    return {
+        "invoice_id": invoice.id,
+        "tracker_token": result["tracker_token"],
+        "checkout_url": result["checkout_url"],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Safepay – webhook receiver
+# ─────────────────────────────────────────────────────────────────────────────
+
+logger = logging.getLogger(__name__)
+
+@app.post("/safepay/webhook", status_code=200)
+async def safepay_webhook(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    body_bytes = await request.body()
+    signature = request.headers.get("X-SFPY-Signature", "")
+
+    if not safepay_service.verify_webhook_signature(
+        body_bytes, signature, headers=dict(request.headers)
+    ):
+        logger.warning("Safepay webhook signature verification failed")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid webhook signature",
+        )
+
+    try:
+        payload = json.loads(body_bytes)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    event_type = payload.get("type")
+    notification = payload.get("notification", {})
+
+    tracker_token = notification.get("tracker")
+    payment_state = str(notification.get("state", "")).upper()
+
+    if event_type == "payment:created" and tracker_token:
+        invoice = (
+            db.query(Invoice)
+            .filter(Invoice.safepay_tracker == tracker_token)
+            .first()
+        )
+
+        if invoice and payment_state == "PAID":
+            if invoice.status != "paid":
+                invoice.status = "paid"
+                db.commit()
+
+        elif not invoice:
+            logger.warning(
+                "No invoice found for Safepay tracker"
+            )
+
+    return {"received": True}
 
 @app.get("/me", response_model=UserResponse)
 def get_me(
