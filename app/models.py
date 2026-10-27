@@ -117,6 +117,13 @@ class Invoice(Base):
         nullable=False
     )
 
+    # Safepay tracker token — populated when tenant initiates payment
+    safepay_tracker: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        default=None
+    )
+
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
